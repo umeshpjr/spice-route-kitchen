@@ -140,3 +140,83 @@ Test ticket closed successfully
 Final documentation published to team's shared location
 
 Dependencies: PBI 10
+
+# Prompt for Databricks Assistant / Genie
+
+Copy everything below into the Databricks Assistant (or a new notebook prompt) to generate the job.
+
+---
+
+Build a Databricks job (PySpark, Python 3.10+, Unity Catalog enabled) that evaluates Azure AI-related security controls against live Azure resource metadata and writes the results to a Delta table. Follow this spec exactly.
+
+## 1. Authentication
+
+- Authenticate to Azure using a service principal (SPN) with Reader-only access at the subscription/management-group scope.
+- Do not hardcode credentials. Read `AZURE_TENANT_ID`, `AZURE_CLIENT_ID`, and `AZURE_CLIENT_SECRET` from a Databricks secret scope named `azure-compliance-scope`, which is backed by an Azure Key Vault.
+- Use `azure-identity`'s `ClientSecretCredential` to build the credential object, then pass it into the SDK clients below.
+- Install/import: `azure-identity`, `azure-mgmt-resourcegraph`, `azure-mgmt-resource`, `requests` (for the Policy Insights REST call), `pyspark.sql`.
+
+## 2. Resource enumeration
+
+- Use `azure-mgmt-resourcegraph` (`ResourceGraphClient`) to run KQL queries against `Resources` at subscription scope, paginating through `$skipToken` until exhausted.
+- Pull at minimum: `id`, `type`, `name`, `resourceGroup`, `subscriptionId`, `location`, `tags`, `kind` (where applicable), and the full `properties` blob for each resource type listed in the control mapping table (Section 4).
+- Only query the resource types actually referenced by a control — don't do a blanket `Resources` pull with no type filter.
+
+## 3. Policy compliance state
+
+- For controls whose "Azure Data Source" is Policy Insights, call the Policy Insights REST API (`https://management.azure.com/{scope}/providers/Microsoft.PolicyInsights/policyStates/latest/queryResults?api-version=2019-10-01`) using the same SPN credential (get a bearer token via `credential.get_token("https://management.azure.com/.default")`).
+- Parse `policyAssignmentId`, `policyDefinitionId`, `resourceId`, and `complianceState` per result.
+
+## 4. Control mapping table
+
+Load the control-to-metadata mapping from the attached reference (`AI_Control_Azure_Metadata_Mapping.xlsx`, sheet `AI_Control_Metadata_Mapping`) as the source of truth — do not hardcode control logic inline. Read it into a small Delta/config table with columns: `control_id`, `domain`, `control_name`, `resource_types`, `data_source` (`resource_graph` | `policy_insights` | `process_control`), `metadata_property`, `compliant_condition`.
+
+For each control where `data_source = resource_graph`: write a small evaluator function that takes a resource's `properties` dict and the `metadata_property`/`compliant_condition` for that control, and returns `(compliant: bool, reason: str)`. Examples to implement first (these have unambiguous single-property checks):
+
+- `F_25` — TLS: compliant if `properties.minimalTlsVersion >= "1.2"`.
+- `F_27` — HTTPS-only: compliant if `properties.httpsOnly == true`.
+- `F_38` / `F_41` — Zone redundancy: compliant if `properties.zoneRedundant == true`.
+- `F_39` — Key Vault purge protection: compliant if `properties.enablePurgeProtection == true`.
+- `F_44` / `F_45` / `F_46` — Event Hub network rules: compliant per the conditions in the mapping table.
+- `F_03` / `F_13` — Local auth disabled: compliant if `properties.disableLocalAuth == true` or the Storage `allowSharedKeyAccess == false` equivalent (branch by resource type).
+
+For controls where `data_source = policy_insights` (e.g. `F_22`, `F_48`, `F_49`): join the resource's `id` against the Policy Insights results from Section 3 and map `complianceState` directly to the output.
+
+For controls where `data_source = process_control` (e.g. `F_28`, `F_29`, `F_31`, `F_32`, `F_34`): do not attempt automated evaluation. Write one row per resource-in-scope (or a single tenant-level row if there's no resource) with `compliant = NULL` and `reason = "process control — not evaluable from resource metadata, requires attestation"`.
+
+## 5. Output schema
+
+Write results to a Unity Catalog Delta table `main.ai_compliance.control_evaluations` (create if not exists) with this schema:
+
+```
+resource_id         STRING
+resource_type       STRING
+subscription_id     STRING
+control_id          STRING
+domain              STRING
+control_name        STRING
+data_source         STRING
+compliant           BOOLEAN   -- nullable for process controls
+reason              STRING
+evaluated_at         TIMESTAMP
+```
+
+Use `MERGE INTO` keyed on `(resource_id, control_id)` so re-runs update existing rows rather than duplicating them.
+
+## 6. Job structure
+
+- Package as a Databricks Job with a single task running this notebook/script on a job cluster (not all-purpose, no autoscaling needed above 2 workers — this is metadata volume, not big data).
+- Parameterize the list of target subscription IDs as a job parameter/widget, not hardcoded.
+- Schedule: daily, off business hours.
+- On failure, log the exception and the last successfully processed resource type, and fail the job (don't swallow errors silently) so job alerting fires.
+- Add basic logging (`print`/`logging`) at the start/end of each phase: auth, resource graph pull, policy insights pull, evaluation, write.
+
+## 7. What not to do
+
+- Don't request or use any role beyond Reader for the SPN.
+- Don't write secrets, tokens, or the raw `properties` blob (which can be large/sensitive) into notebook output or job logs — log only counts and resource IDs.
+- Don't build a dashboard in this job — that's a separate Databricks SQL/Power BI task on top of the Delta table.
+
+## 8. Deliverable
+
+Output a single Python notebook (or `.py` job file) implementing the above, plus a short markdown comment block at the top summarizing the auth flow and the three data-source paths (Resource Graph / Policy Insights / process control).
