@@ -10,16 +10,16 @@ Build a production-grade Databricks pipeline in Python that uses a Service Princ
 
 ### ENVIRONMENT AND SECRETS
 
-All secrets live in Databricks Secret Scope `"kv-nfcu-prod"`. Retrieve them using:
+All secrets live in Databricks Secret Scope `"kv--prod"`. Retrieve them using:
 ```python
-dbutils.secrets.get(scope="kv-nfcu-prod", key="<key-name>")
+dbutils.secrets.get(scope="kv--prod", key="<key-name>")
 ```
 
 Secret key names to use:
 - `spn-tenant-id`          → Entra ID tenant ID
 - `spn-client-id`          → App registration client ID
 - `spn-client-secret`      → App registration client secret
-- `dataverse-env-url`      → e.g. `https://nfcuorg.crm.dynamics.com`
+- `dataverse-env-url`      → e.g. `https://org.crm.dynamics.com`
 - `appinsights-app-id`     → Application Insights application (instrumentation) ID
 - `appinsights-resource-id`→ Full ARM resource ID for the App Insights resource
 
